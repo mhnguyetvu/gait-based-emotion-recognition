@@ -1,0 +1,37 @@
+# Local Python environments and runtime files
+/.runtime/
+/.venv/
+/.venv-*/
+/venv/
+/env/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter-generated files
+.ipynb_checkpoints/
+
+# Local logs and run outputs
+*.log
+step_data_check.txt
+**/logs/
+
+# Local datasets and raw gait exports
+/data/
+/E-Gait/csv/
+/E-Gait/*.h5
+/E-Gait/*.hdf5
+/E-Gait/*.mp4
+
+# Generated model checkpoints and training output directories
+*.pth
+*.pth.tar
+*.pt
+*.ckpt
+**/model_classifier_*/
+/generator_cvae/model_gait_cvae_stgcn/
+
+# IDE-local settings
+/.idea/

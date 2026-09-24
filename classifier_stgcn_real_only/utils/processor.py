@@ -1,515 +1,432 @@
-import h5py
+"""Training loop and activation diagnostics for Baseline-STEP."""
+
 import math
 import os
-import matplotlib as mpl
+
 import numpy as np
 import torch
-import torch.optim as optim
 import torch.nn as nn
-from matplotlib import colors as mcolors
-from matplotlib import pyplot as plt
-from matplotlib import rcParams
+import torch.optim as optim
+
 from net import classifier
-from torch.nn import ModuleList, ReLU
-from torchlight import torchlight
+import torchlight
 
 
-class GuidedBackprop():
-    """
-       Produces gradients generated with guided back propagation from the given image
-    """
-    def __init__(self, model):
-        self.model = model
-        self.gradients = None
-        self.forward_relu_outputs = []
-        # Put model in evaluation mode
-        self.model.eval()
-
-        #self.update_relus()
-        self.hook_layers()
-
-    def hook_layers(self):
-        def hook_function(module, grad_in, grad_out):
-            self.gradients = grad_in[0]
-        # Register hook to the first layer
-        first_layer = list(self.model._modules.items())[1][1][0].gcn.conv
-        first_layer.register_backward_hook(hook_function)
-
-    # def update_relus(self):
-        """
-            Updates relu activation functions so that
-                1- stores output in forward pass
-                2- imputes zero for gradient values that are less than zero
-        """
-        def relu_backward_hook_function(module, grad_in, grad_out):
-            """
-            If there is a negative gradient, change it to zero
-            """
-            # Get last forward output
-            corresponding_forward_output = self.forward_relu_outputs[-1]
-            corresponding_forward_output[corresponding_forward_output > 0] = 1
-            modified_grad_out = corresponding_forward_output * torch.clamp(grad_in[0], min=0.0)
-            del self.forward_relu_outputs[-1]  # Remove last forward output
-            return (modified_grad_out,)
-
-        def relu_forward_hook_function(module, ten_in, ten_out):
-            """
-            Store results of forward pass
-            """
-            self.forward_relu_outputs.append(ten_out)
-
-        # Loop through layers, hook up ReLUs
-        for pos, module in self.model._modules.items():
-            if isinstance(module, ModuleList):
-                for each_module in module:
-                    each_module.relu.register_backward_hook(relu_backward_hook_function)
-                    each_module.relu.register_forward_hook(relu_forward_hook_function)
-
-    #
-    # def update_relus(self):
-    #     """
-    #         Updates relu activation functions so that
-    #             1- stores output in forward pass
-    #             2- imputes zero for gradient values that are less than zero
-    #     """
-    #     def relu_backward_hook_function(module, grad_in, grad_out):
-    #         """
-    #         If there is a negative gradient, change it to zero
-    #         """
-    #         # Get last forward output
-    #         corresponding_forward_output = self.forward_relu_outputs[-1]
-    #         corresponding_forward_output[corresponding_forward_output > 0] = 1
-    #         modified_grad_out = corresponding_forward_output * torch.clamp(grad_in[0], min=0.0)
-    #         del self.forward_relu_outputs[-1]  # Remove last forward output
-    #         return (modified_grad_out,)
-    #
-    #     def relu_forward_hook_function(module, ten_in, ten_out):
-    #         """
-    #         Store results of forward pass
-    #         """
-    #         self.forward_relu_outputs.append(ten_out)
-    #
-    #     # Loop through layers, hook up ReLUs
-    #     for pos, module in self.model.features._modules.items():
-    #         if isinstance(module, ReLU):
-    #             module.register_backward_hook(relu_backward_hook_function)
-    #             module.register_forward_hook(relu_forward_hook_function)
-
-    def generate_gradients(self, input_image, target_class):
-
-        # Forward pass
-        output, _ = self.model(input_image)
-
-        # Zero gradients
-        self.model.zero_grad()
-        # Target for backprop
-        one_hot_output = torch.cuda.FloatTensor(output.size()).zero_()
-        for idx in range(output.shape[0]):
-            one_hot_output[idx, target_class[idx]] = 1
-        # Backward pass
-        output.backward(gradient=one_hot_output)
-        # Convert Pytorch variable to numpy array
-        # [0] to get rid of the first channel (1,3,224,224)
-        gradients_as_arr = self.gradients.data.numpy()[0]
-        return gradients_as_arr
-
-
-def weights_init(m):
-    classname = m.__class__.__name__
-    if classname.find('Conv1d') != -1:
-        m.weight.data.normal_(0.0, 0.02)
-        if m.bias is not None:
-            m.bias.data.fill_(0)
-    elif classname.find('Conv2d') != -1:
-        m.weight.data.normal_(0.0, 0.02)
-        if m.bias is not None:
-            m.bias.data.fill_(0)
-    elif classname.find('BatchNorm') != -1:
-        m.weight.data.normal_(1.0, 0.02)
-        m.bias.data.fill_(0)
-
-
-def find_all_substr(a_str, sub):
-    start = 0
-    while True:
-        start = a_str.find(sub, start)
-        if start == -1:
-            return
-        yield start
-        start += len(sub)  # use start += 1 to find overlapping matches
-
-
-def get_best_epoch_and_accuracy(path_to_model_files):
-    all_models = os.listdir(path_to_model_files)
-    while '_' not in all_models[-1]:
-        all_models = all_models[:-1]
-    best_model = all_models[-1]
-    all_us = list(find_all_substr(best_model, '_'))
-    return int(best_model[5:all_us[0]]), float(best_model[all_us[0]+4:all_us[1]])
-
-
-def plot_confusion_matrix(confusion_matrix, title='CM', fontsize=50):
-    mpl.style.use('seaborn')
-    rcParams['text.usetex'] = True
-    rcParams['axes.titlepad'] = 20
-
-    columns = ('Angry', 'Neutral', 'Happy', 'Sad')
-    rows = columns
-    fig, ax = plt.subplots()
-
-    # Set colors
-    colors = np.empty((4, 4))
-    colors[0] = np.array(mcolors.to_rgba(mcolors.CSS4_COLORS['goldenrod'], 1.0))
-    colors[1] = np.array(mcolors.to_rgba(mcolors.CSS4_COLORS['bisque'], 1.0))
-    colors[2] = np.array(mcolors.to_rgba(mcolors.CSS4_COLORS['paleturquoise'], 1.0))
-    colors[3] = np.array(mcolors.to_rgba(mcolors.CSS4_COLORS['limegreen'], 1.0))
-    # colors[4] = np.array(mcolors.to_rgba(mcolors.CSS4_COLORS['lightpink'], 1.0))
-    # colors[5] = np.array(mcolors.to_rgba(mcolors.CSS4_COLORS['hotpink'], 1.0))
-    # colors[6] = np.array(mcolors.to_rgba(mcolors.CSS4_COLORS['mistyrose'], 1.0))
-    # colors[7] = np.array(mcolors.to_rgba(mcolors.CSS4_COLORS['lightsalmon'], 1.0))
-    # colors[8] = np.array(mcolors.to_rgba(mcolors.CSS4_COLORS['lavender'], 1.0))
-    # colors[9] = np.array(mcolors.to_rgba(mcolors.CSS4_COLORS['cornflowerblue'], 1.0))
-
-    n_rows = len(confusion_matrix)
-    index = np.arange(len(columns)) + 0.3
-    bar_width = 0.4
-
-    # Initialize the vertical-offset for the stacked bar chart.
-    y_offset = np.zeros(len(columns))
-
-    # Plot bars and create text labels for the table
-    cell_text = []
-    for row in range(n_rows):
-        # plt.bar(index, confusion_matrix[row], bar_width, bottom=y_offset,
-        #                                                 color=colors[row])
-        y_offset = y_offset + confusion_matrix[row]
-        cell_text.append(['%d' % (x) for x in confusion_matrix[row]])
-
-    # Add a table at the bottom of the axes
-    the_table = plt.table(cellText=cell_text,
-                          rowLabels=rows,
-                          rowColours=colors,
-                          colLabels=columns,
-                          loc='bottom')
-    the_table.set_fontsize(fontsize)
-    the_table.scale(1, fontsize/7)
-
-    # Adjust layout to make room for the table:
-    plt.subplots_adjust(left=0.2,
-                        bottom=0.1,
-                        top=0.99)
-
-    for tick in ax.yaxis.get_major_ticks():
-        tick.label.set_fontsize(fontsize)
-    plt.ylabel("\# predictions of each class", fontsize=fontsize)
-    plt.xticks([])
-    fig.savefig('figures/'+title+'.png', bbox_inches='tight')
+def weights_init(module):
+    """Use fan-aware convolution initialization and identity BatchNorm."""
+    if isinstance(module, nn.Conv2d):
+        nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+        if module.weight is not None:
+            nn.init.ones_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
 
 
 class Processor(object):
-    """
-        Processor for gait generation
-    """
+    """Train/evaluate the real-only ST-GCN classifier."""
 
-    def __init__(self, args, data_loader, C, num_classes, graph_dict, device='cuda:0', verbose=True):
-
+    def __init__(
+        self,
+        args,
+        data_loader,
+        in_channels,
+        num_classes,
+        graph_dict,
+        device="cuda:0",
+        verbose=True,
+    ):
         self.args = args
         self.data_loader = data_loader
-        self.num_classes = num_classes
-        self.result = dict()
-        self.iter_info = dict()
-        self.epoch_info = dict()
-        self.meta_info = dict(epoch=0, iter=0)
+        self.num_classes = int(num_classes)
         self.device = device
         self.verbose = verbose
+        self.result = {}
+        self.meta_info = {"epoch": 0, "iter": 0}
+        self.best_epoch = None
+        self.best_val_accuracy = -1.0
+        self.best_val_loss = float("inf")
+        self.best_checkpoint = None
+        self._debug_printed = False
+
+        os.makedirs(self.args.work_dir, exist_ok=True)
         self.io = torchlight.IO(
             self.args.work_dir,
             save_log=self.args.save_log,
-            print_log=self.args.print_log)
-
-        # model
-        if not os.path.isdir(self.args.work_dir):
-            os.mkdir(self.args.work_dir)
-        self.model = classifier.Classifier(C, num_classes, graph_dict)
-        self.model.cuda('cuda:0')
+            print_log=self.args.print_log,
+        )
+        self.model = classifier.Classifier(
+            in_channels,
+            self.num_classes,
+            graph_dict,
+            temporal_kernel_size=9,
+        ).to(self.device)
         self.model.apply(weights_init)
         self.loss = nn.CrossEntropyLoss()
-        self.best_loss = math.inf
-        self.step_epochs = [math.ceil(float(self.args.num_epoch * x)) for x in self.args.step]
-        self.best_epoch = None
-        self.best_accuracy = np.zeros((1, np.max(self.args.topk)))
-        self.accuracy_updated = False
 
-        # optimizer
-        if self.args.optimizer == 'SGD':
-            self.optimizer = optim.SGD(
-                self.model.parameters(),
-                lr=self.args.base_lr,
-                momentum=0.9,
-                nesterov=self.args.nesterov,
-                weight_decay=self.args.weight_decay)
-        elif self.args.optimizer == 'Adam':
+        if self.args.optimizer.lower() == "adam":
             self.optimizer = optim.Adam(
                 self.model.parameters(),
                 lr=self.args.base_lr,
-                weight_decay=self.args.weight_decay)
+                betas=(0.9, 0.999),
+                weight_decay=self.args.weight_decay,
+            )
+        elif self.args.optimizer.lower() == "sgd":
+            self.optimizer = optim.SGD(
+                self.model.parameters(),
+                lr=self.args.base_lr,
+                momentum=self.args.momentum,
+                nesterov=self.args.nesterov,
+                weight_decay=self.args.weight_decay,
+            )
         else:
-            raise ValueError()
-        self.lr = self.args.base_lr
+            raise ValueError("Unsupported optimizer: {}".format(self.args.optimizer))
+
+        configured_steps = getattr(self.args, "lr_steps", None)
+        if configured_steps:
+            self.step_epochs = list(configured_steps)
+        elif self.args.num_epoch == 500:
+            self.step_epochs = [250, 375, 438]
+        else:
+            self.step_epochs = [
+                int(math.ceil(self.args.num_epoch * 0.50)),
+                int(math.ceil(self.args.num_epoch * 0.75)),
+                int(math.ceil(self.args.num_epoch * 0.876)),
+            ]
+        self.lr = float(self.args.base_lr)
 
     def adjust_lr(self):
+        epoch = int(self.meta_info["epoch"])
+        num_decays = sum(epoch >= step for step in self.step_epochs)
+        self.lr = float(self.args.base_lr) * (0.1 ** num_decays)
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.lr
 
-        # if self.args.optimizer == 'SGD' and\
-        if self.meta_info['epoch'] in self.step_epochs:
-            lr = self.args.base_lr * (
-                    0.1 ** np.sum(self.meta_info['epoch'] >= np.array(self.step_epochs)))
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = lr
-            self.lr = lr
+    @staticmethod
+    def top1_accuracy(logits, labels):
+        predictions = np.argmax(logits, axis=1)
+        return 100.0 * float(np.mean(predictions == labels))
 
-    def show_epoch_info(self):
+    @staticmethod
+    def _tensor_stats(name, tensor):
+        values = tensor.detach().float()
+        print(
+            "{}: shape={} min={:.8f} max={:.8f} mean={:.8f} std={:.8f} "
+            "zero_fraction={:.6f} finite={}".format(
+                name,
+                tuple(values.shape),
+                values.min().item(),
+                values.max().item(),
+                values.mean().item(),
+                values.std(unbiased=False).item(),
+                (values == 0).float().mean().item(),
+                bool(torch.isfinite(values).all().item()),
+            )
+        )
 
-        for k, v in self.epoch_info.items():
-            if self.verbose:
-                self.io.print_log('\t{}: {}'.format(k, v))
-        if self.args.pavi_log:
-            if self.verbose:
-                self.io.log('train', self.meta_info['iter'], self.epoch_info)
+    def _register_activation_hooks(self):
+        handles = []
+        for index, block in enumerate(self.model.st_gcn_networks):
+            def report_activation(_module, _inputs, output, block_index=index):
+                activations = output[0] if isinstance(output, tuple) else output
+                self._tensor_stats(
+                    "ST-GCN block {} output".format(block_index + 1),
+                    activations,
+                )
+            handles.append(block.register_forward_hook(report_activation))
+        return handles
 
-    def show_iter_info(self):
-
-        if self.meta_info['iter'] % self.args.log_interval == 0:
-            info = '\tIter {} Done.'.format(self.meta_info['iter'])
-            for k, v in self.iter_info.items():
-                if isinstance(v, float):
-                    info = info + ' | {}: {:.4f}'.format(k, v)
-                else:
-                    info = info + ' | {}: {}'.format(k, v)
-            if self.verbose:
-                self.io.print_log(info)
-
-            if self.args.pavi_log:
-                self.io.log('train', self.meta_info['iter'], self.iter_info)
-
-    def show_topk(self, k):
-
-        rank = self.result.argsort()
-        hit_top_k = [l in rank[i, -k:] for i, l in enumerate(self.label)]
-        accuracy = 100. * sum(hit_top_k) * 1.0 / len(hit_top_k)
-        if accuracy > self.best_accuracy[0, k-1]:
-            self.best_accuracy[0, k-1] = accuracy
-            self.accuracy_updated = True
-        else:
-            self.accuracy_updated = False
-        if self.verbose:
-            print_epoch = self.best_epoch if self.best_epoch is not None else 0
-            self.io.print_log('\tTop{}: {:.2f}%. Best so far: {:.2f}% (epoch: {:d}).'.
-                              format(k, accuracy, self.best_accuracy[0, k-1], print_epoch))
+    def _report_gradients(self):
+        print("\n[DEBUG] FIRST-BATCH GRADIENT SUMMARY")
+        for name, parameter in self.model.named_parameters():
+            if parameter.grad is None:
+                continue
+            grad = parameter.grad.detach().float()
+            if any(token in name for token in (
+                "data_bn", "st_gcn_networks.0", "st_gcn_networks.1",
+                "st_gcn_networks.2", "fcn",
+            )):
+                print(
+                    "  {}: mean_abs={:.8e} max_abs={:.8e} finite={}".format(
+                        name,
+                        grad.abs().mean().item(),
+                        grad.abs().max().item(),
+                        bool(torch.isfinite(grad).all().item()),
+                    )
+                )
 
     def per_train(self):
-
         self.model.train()
         self.adjust_lr()
-        loader = self.data_loader['train']
-        loss_value = []
+        loader = self.data_loader["train"]
+        loss_values = []
+        logits_all = []
+        labels_all = []
 
-        for data, label in loader:
-            # get data
+        for batch_index, (data, labels) in enumerate(loader):
             data = data.float().to(self.device)
-            label = label.long().to(self.device)
+            labels = labels.long().to(self.device)
+            if not torch.isfinite(data).all():
+                raise FloatingPointError("Training input contains NaN or Inf.")
 
-            # forward
-            output, _ = self.model(data)
-            loss = self.loss(output, label)
-
-            # backward
+            debug_batch = (
+                self.meta_info["epoch"] == 0
+                and batch_index == 0
+                and not self._debug_printed
+            )
+            hook_handles = self._register_activation_hooks() if debug_batch else []
             self.optimizer.zero_grad()
+            logits, features = self.model(data)
+            for handle in hook_handles:
+                handle.remove()
+            loss = self.loss(logits, labels)
+
+            if debug_batch:
+                print("\n" + "=" * 72)
+                print("FIRST-BATCH BASELINE-STEP DIAGNOSTIC")
+                print("=" * 72)
+                print("labels:", labels.detach().cpu().numpy())
+                self._tensor_stats("input", data)
+                self._tensor_stats("logits", logits)
+                self._tensor_stats("pooled feature", features)
+
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    "Non-finite loss at epoch {}, batch {}: {}".format(
+                        self.meta_info["epoch"], batch_index, loss.item()
+                    )
+                )
             loss.backward()
+
+            for name, parameter in self.model.named_parameters():
+                if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
+                    raise FloatingPointError(
+                        "Non-finite gradient at epoch {}, batch {}, parameter {}."
+                        .format(self.meta_info["epoch"], batch_index, name)
+                    )
+            if debug_batch:
+                self._report_gradients()
+
+            grad_clip = float(getattr(self.args, "grad_clip", 0.0))
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
             self.optimizer.step()
 
-            # statistics
-            self.iter_info['loss'] = loss.data.item()
-            self.iter_info['lr'] = '{:.6f}'.format(self.lr)
-            loss_value.append(self.iter_info['loss'])
-            self.show_iter_info()
-            self.meta_info['iter'] += 1
+            loss_values.append(float(loss.item()))
+            logits_all.append(logits.detach().cpu().numpy())
+            labels_all.append(labels.detach().cpu().numpy())
+            self.meta_info["iter"] += 1
 
-        self.epoch_info['mean_loss'] = np.mean(loss_value)
-        self.show_epoch_info()
-        if self.verbose:
-            self.io.print_timer()
-        # for k in self.args.topk:
-        #     self.calculate_topk(k, show=False)
-        # if self.accuracy_updated:
-            # self.model.extract_feature()
+            if debug_batch:
+                with torch.no_grad():
+                    updated_logits, updated_features = self.model(data)
+                self._tensor_stats("logits after first update", updated_logits)
+                self._tensor_stats("feature after first update", updated_features)
+                print("=" * 72 + "\n")
+                self._debug_printed = True
 
-    def per_test(self, evaluation=True):
+            log_interval = max(1, int(self.args.log_interval))
+            if self.meta_info["iter"] % log_interval == 0 and self.verbose:
+                self.io.print_log(
+                    "\tIter {} | loss {:.6f} | lr {:.6g}".format(
+                        self.meta_info["iter"], loss.item(), self.lr
+                    )
+                )
 
+        if not loss_values:
+            raise ValueError("Training loader produced no batches.")
+        logits_all = np.concatenate(logits_all, axis=0)
+        labels_all = np.concatenate(labels_all, axis=0)
+        return (
+            float(np.mean(loss_values)),
+            self.top1_accuracy(logits_all, labels_all),
+        )
+
+    def evaluate_loader(self, split):
+        if split not in self.data_loader:
+            raise KeyError("Missing DataLoader split: {}".format(split))
         self.model.eval()
-        loader = self.data_loader['test']
-        loss_value = []
-        result_frag = []
-        label_frag = []
+        losses = []
+        logits_fragments = []
+        label_fragments = []
 
-        for data, label in loader:
+        with torch.no_grad():
+            for data, labels in self.data_loader[split]:
+                data = data.float().to(self.device)
+                labels = labels.long().to(self.device)
+                logits, _ = self.model(data)
+                loss = self.loss(logits, labels)
+                if not torch.isfinite(logits).all() or not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        "Non-finite {} output/loss.".format(split)
+                    )
+                losses.append(float(loss.item()))
+                logits_fragments.append(logits.cpu().numpy())
+                label_fragments.append(labels.cpu().numpy())
 
-            # get data
-            data = data.float().to(self.device)
-            label = label.long().to(self.device)
+        if not losses:
+            raise ValueError("{} loader produced no batches.".format(split))
+        logits = np.concatenate(logits_fragments, axis=0)
+        labels = np.concatenate(label_fragments, axis=0)
+        return {
+            "loss": float(np.mean(losses)),
+            "accuracy": self.top1_accuracy(logits, labels),
+            "logits": logits,
+            "labels": labels,
+        }
 
-            # inference
-            with torch.no_grad():
-                output, _ = self.model(data)
-            result_frag.append(output.data.cpu().numpy())
-
-            # get loss
-            if evaluation:
-                loss = self.loss(output, label)
-                loss_value.append(loss.item())
-                label_frag.append(label.data.cpu().numpy())
-
-        self.result = np.concatenate(result_frag)
-        if evaluation:
-            self.label = np.concatenate(label_frag)
-            self.epoch_info['mean_loss'] = np.mean(loss_value)
-            self.show_epoch_info()
-
-            # show top-k accuracy
-            for k in self.args.topk:
-                self.show_topk(k)
-
-    def train(self):
-
-        for epoch in range(self.args.start_epoch, self.args.num_epoch):
-            self.meta_info['epoch'] = epoch
-
-            # training
-            if self.verbose:
-                self.io.print_log('Training epoch: {}'.format(epoch))
-            self.per_train()
-            if self.verbose:
-                self.io.print_log('Done.')
-
-            # evaluation
-            if (epoch % self.args.eval_interval == 0) or (
-                    epoch + 1 == self.args.num_epoch):
-                if self.verbose:
-                    self.io.print_log('Eval epoch: {}'.format(epoch))
-                self.per_test()
-                if self.verbose:
-                    self.io.print_log('Done.')
-
-            # save model and weights
-            if self.accuracy_updated:
-                torch.save(self.model.state_dict(),
-                           os.path.join(self.args.work_dir,
-                                        'epoch{}_acc{:.2f}_model.pth.tar'.format(epoch, self.best_accuracy.item())))
-                if self.epoch_info['mean_loss'] < self.best_loss:
-                    self.best_loss = self.epoch_info['mean_loss']
-                self.best_epoch = epoch
-
-    def test(self):
-
-        # the path of weights must be appointed
-        if self.args.weights is None:
-            raise ValueError('Please appoint --weights.')
+    def save_best_checkpoint(self, epoch, val_accuracy, val_loss):
+        filename = "epoch{}_valacc{:.2f}_model.pth.tar".format(epoch, val_accuracy)
+        path = os.path.join(self.args.work_dir, filename)
+        torch.save(self.model.state_dict(), path)
+        torch.save(
+            self.model.state_dict(),
+            os.path.join(self.args.work_dir, "best_model.pth.tar"),
+        )
+        self.best_epoch = int(epoch)
+        self.best_val_accuracy = float(val_accuracy)
+        self.best_val_loss = float(val_loss)
+        self.best_checkpoint = path
         if self.verbose:
-            self.io.print_log('Model:   {}.'.format(self.args.model))
-            self.io.print_log('Weights: {}.'.format(self.args.weights))
-
-        # evaluation
-        if self.verbose:
-            self.io.print_log('Evaluation Start:')
-        self.per_test()
-        if self.verbose:
-            self.io.print_log('Done.\n')
-
-        # save the output of model
-        if self.args.save_result:
-            result_dict = dict(
-                zip(self.data_loader['test'].dataset.sample_name,
-                    self.result))
-            self.io.save_pkl(result_dict, 'test_result.pkl')
-
-    def smap(self):
-        # self.model.eval()
-        loader = self.data_loader['test']
-
-        for data, label in loader:
-
-            # get data
-            data = data.float().to(self.device)
-            label = label.long().to(self.device)
-
-            GBP = GuidedBackprop(self.model)
-            guided_grads = GBP.generate_gradients(data, label)
+            self.io.print_log(
+                "\tNew best checkpoint: epoch {} | val Top1 {:.2f}% | val loss {:.6f}"
+                .format(epoch, val_accuracy, val_loss)
+            )
 
     def load_best_model(self):
-        if self.best_epoch is None:
-            self.best_epoch, best_accuracy = get_best_epoch_and_accuracy(self.args.work_dir)
-        else:
-            best_accuracy = self.best_accuracy.item()
+        path = self.best_checkpoint or os.path.join(
+            self.args.work_dir, "best_model.pth.tar"
+        )
+        if not os.path.isfile(path):
+            raise FileNotFoundError("Best checkpoint not found: {}".format(path))
+        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        return path
 
-        filename = os.path.join(self.args.work_dir,
-                                'epoch{}_acc{:.2f}_model.pth.tar'.format(self.best_epoch, best_accuracy))
-        self.model.load_state_dict(torch.load(filename))
+    def train_tiny_overfit(self, target_accuracy=100.0, max_epochs=1000):
+        """Train on the same balanced 16 samples until they are memorized."""
+        if "train" not in self.data_loader:
+            raise KeyError("Tiny-overfit loader needs a 'train' split.")
+        best_accuracy = -1.0
+        best_loss = float("inf")
+        best_state = None
+        best_epoch = -1
 
-    def generate_predictions(self, data, num_classes, joints, coords):
-        # fin = h5py.File('../data/features'+ftype+'.h5', 'r')
-        # fkeys = fin.keys()
-        labels_pred = np.zeros(data.shape[0])
-        output = np.zeros((data.shape[0], num_classes))
-        for i, each_data in enumerate(zip(data)):
-            # get data
-            each_data = each_data[0]
-            each_data = np.reshape(each_data, (1, each_data.shape[0], joints, coords, 1))
-            each_data = np.moveaxis(each_data, [1, 2, 3], [2, 3, 1])
-            each_data = torch.from_numpy(each_data).float().to(self.device)
-            # get label
-            with torch.no_grad():
-                output_torch, _ = self.model(each_data)
-                output[i] = output_torch.detach().cpu().numpy()
-                labels_pred[i] = np.argmax(output[i])
-        return labels_pred, output
+        for epoch in range(int(max_epochs)):
+            self.meta_info["epoch"] = epoch
+            train_loss, online_accuracy = self.per_train()
+            metrics = self.evaluate_loader("train")
+            accuracy = metrics["accuracy"]
+            if (accuracy > best_accuracy) or (
+                accuracy == best_accuracy and metrics["loss"] < best_loss
+            ):
+                best_accuracy = accuracy
+                best_loss = metrics["loss"]
+                best_epoch = epoch
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in self.model.state_dict().items()
+                }
 
-    def generate_confusion_matrix(self, ftype, data, labels, num_classes, joints, coords):
+            if self.verbose:
+                self.io.print_log(
+                    "Tiny epoch {:4d} | loss {:.6f} | online acc {:.2f}% | "
+                    "eval train acc {:.2f}% | lr {:.6g}".format(
+                        epoch, train_loss, online_accuracy, accuracy, self.lr
+                    )
+                )
+            if accuracy >= float(target_accuracy):
+                break
+
+        if best_state is None:
+            raise RuntimeError("Tiny-overfit stage did not complete an epoch.")
+        self.model.load_state_dict(best_state)
+        checkpoint_path = os.path.join(self.args.work_dir, "tiny_overfit_model.pth.tar")
+        torch.save(self.model.state_dict(), checkpoint_path)
+        passed = best_accuracy >= float(target_accuracy)
+        if self.verbose:
+            self.io.print_log(
+                "Tiny-overfit result: {:.2f}% train accuracy at epoch {} ({})"
+                .format(best_accuracy, best_epoch, "PASS" if passed else "FAIL")
+            )
+        return {
+            "train_accuracy": best_accuracy,
+            "train_loss": best_loss,
+            "best_epoch": best_epoch,
+            "epochs_run": epoch + 1,
+            "passed": passed,
+            "checkpoint": checkpoint_path,
+        }
+
+    def train(self):
+        for split in ("train", "val", "test"):
+            if split not in self.data_loader:
+                raise KeyError("Missing DataLoader split: {}".format(split))
+
+        last_train_accuracy = 0.0
+        for epoch in range(int(self.args.num_epoch)):
+            self.meta_info["epoch"] = epoch
+            if self.verbose:
+                self.io.print_log("Training epoch: {}".format(epoch))
+            train_loss, last_train_accuracy = self.per_train()
+            if self.verbose:
+                self.io.print_log("\ttrain_loss: {:.6f}".format(train_loss))
+                self.io.print_log("\ttrain Top1: {:.2f}%".format(last_train_accuracy))
+                self.io.print_log("\tlr: {:.6g}".format(self.lr))
+
+            if epoch % int(self.args.eval_interval) == 0 or epoch + 1 == int(self.args.num_epoch):
+                val = self.evaluate_loader("val")
+                if self.verbose:
+                    self.io.print_log("Validation epoch: {}".format(epoch))
+                    self.io.print_log("\tval_loss: {:.6f}".format(val["loss"]))
+                    self.io.print_log("\tval Top1: {:.2f}%".format(val["accuracy"]))
+                is_better = val["accuracy"] > self.best_val_accuracy or (
+                    val["accuracy"] == self.best_val_accuracy
+                    and val["loss"] < self.best_val_loss
+                )
+                if is_better:
+                    self.save_best_checkpoint(epoch, val["accuracy"], val["loss"])
+
+        if self.best_checkpoint is None:
+            raise RuntimeError("No validation checkpoint was produced.")
         self.load_best_model()
-        labels_pred = self.generate_predictions(data, num_classes, joints, coords)
+        train_metrics = self.evaluate_loader("train")
+        test_metrics = self.evaluate_loader("test")
+        self.result = test_metrics["logits"]
+        self.label = test_metrics["labels"]
 
-        hit = np.nonzero(labels_pred == labels)
-        miss = np.nonzero(labels_pred != labels)
-        confusion_matrix = np.zeros((num_classes, num_classes))
-        for hidx in np.arange(len(hit[0])):
-            confusion_matrix[np.int(labels[hit[0][hidx]]), np.int(labels_pred[hit[0][hidx]])] += 1
-        for midx in np.arange(len(miss[0])):
-            confusion_matrix[np.int(labels[miss[0][midx]]), np.int(labels_pred[miss[0][midx]])] += 1
-        confusion_matrix = confusion_matrix.transpose()
-        plot_confusion_matrix(confusion_matrix)
+        if self.verbose:
+            self.io.print_log("Final evaluation using best validation checkpoint:")
+            self.io.print_log("\tBest epoch: {}".format(self.best_epoch))
+            self.io.print_log("\tTrain Top1: {:.2f}%".format(train_metrics["accuracy"]))
+            self.io.print_log("\tBest validation Top1: {:.2f}%".format(self.best_val_accuracy))
+            self.io.print_log("\tTest loss: {:.6f}".format(test_metrics["loss"]))
+            self.io.print_log("\tTest Top1: {:.2f}%".format(test_metrics["accuracy"]))
 
-    def save_best_feature(self, ftype, data, joints, coords):
-        if self.best_epoch is None:
-            self.best_epoch, best_accuracy = get_best_epoch_and_accuracy(self.args.work_dir)
-        else:
-            best_accuracy = self.best_accuracy.item()
-        filename = os.path.join(self.args.work_dir,
-                                'epoch{}_acc{:.2f}_model.pth.tar'.format(self.best_epoch, best_accuracy))
-        self.model.load_state_dict(torch.load(filename))
-        features = np.empty((0, 64))
-        fCombined = h5py.File('../data/features'+ftype+'.h5', 'r')
-        fkeys = fCombined.keys()
-        dfCombined = h5py.File('../data/deepFeatures'+ftype+'.h5', 'w')
-        for i, (each_data, each_key) in enumerate(zip(data, fkeys)):
+        return {
+            "best_epoch": self.best_epoch,
+            "train_accuracy": train_metrics["accuracy"],
+            "best_val_accuracy": self.best_val_accuracy,
+            "best_val_loss": self.best_val_loss,
+            "test_accuracy": test_metrics["accuracy"],
+            "test_loss": test_metrics["loss"],
+        }
 
-            # get data
-            each_data = np.reshape(each_data, (1, each_data.shape[0], joints, coords, 1))
-            each_data = np.moveaxis(each_data, [1, 2, 3], [2, 3, 1])
-            each_data = torch.from_numpy(each_data).float().to(self.device)
-
-            # get feature
-            with torch.no_grad():
-                _, feature = self.model(each_data)
-                fname = [each_key][0]
-                dfCombined.create_dataset(fname, data=feature)
-                features = np.append(features, np.array(feature).reshape((1, feature.shape[0])), axis=0)
-        dfCombined.close()
-        return features
+    def generate_predictions(self, data, load_best=True):
+        if load_best:
+            self.load_best_model()
+        dataset = self.data_loader.get("prediction")
+        if dataset is None:
+            from utils.loader import TrainTestLoader
+            dataset = TrainTestLoader(data, np.zeros(len(data), dtype=np.int64))
+        self.model.eval()
+        logits = []
+        with torch.no_grad():
+            for each_data, _ in torch.utils.data.DataLoader(
+                dataset, batch_size=32, shuffle=False
+            ):
+                output, _ = self.model(each_data.float().to(self.device))
+                logits.append(output.cpu().numpy())
+        logits = np.concatenate(logits, axis=0)
+        return np.argmax(logits, axis=1), logits

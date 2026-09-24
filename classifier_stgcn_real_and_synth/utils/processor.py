@@ -6,7 +6,7 @@ import torch
 import torch.optim as optim
 import torch.nn as nn
 from net import classifier
-from torchlight import torchlight
+import torchlight
 
 
 def weights_init(m):

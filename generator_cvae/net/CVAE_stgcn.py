@@ -29,7 +29,7 @@ class CVAE(nn.Module):
         mean, lsig = self.encoder(x, lenc)
 
         sig = torch.exp(0.5 * lsig)
-        eps = to_var(torch.randn([batch_size, self.n_z]))
+        eps = torch.randn(batch_size, self.n_z, device=mean.device, dtype=mean.dtype)
         z = eps * sig + mean
 
         recon_x = self.decoder(z, ldec, self.T, self.V)
@@ -39,7 +39,8 @@ class CVAE(nn.Module):
     def inference(self, n=1, ldec=None):
 
         batch_size = n
-        z = to_var(torch.randn([batch_size, self.n_z]))
+        parameter = next(self.decoder.parameters())
+        z = torch.randn(batch_size, self.n_z, device=parameter.device, dtype=parameter.dtype)
 
         recon_x = self.decoder(z, ldec)
 
